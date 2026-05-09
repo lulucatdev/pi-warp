@@ -4,7 +4,7 @@
   "description": "Warp terminal integration for Pi — tab status, spinner, and rich session notifications via the warp://cli-agent protocol.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lulucatdev/pi-warp.git"
+    "url": "https://github.com/capyup/pi-warp.git"
   },
   "author": "capyup",
   "license": "MIT",

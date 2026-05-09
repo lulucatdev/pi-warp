@@ -19,7 +19,7 @@ It also updates the terminal title with an animated braille spinner while the ag
 pi install npm:@capyup/pi-warp
 
 # Or from git
-pi install git:github.com/lulucatdev/pi-warp
+pi install git:github.com/capyup/pi-warp
 ```
 
 That's it — the extension auto-activates when Pi detects a Warp terminal (`TERM_PROGRAM=WarpTerminal`). In non-Warp terminals it does nothing.
