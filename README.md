@@ -54,8 +54,10 @@ This gives Warp fine-grained session state: who's running, what they're doing, w
 | Pi lifecycle event | Warp event | Status transition |
 |---|---|---|
 | `session_start` | `session_start` | Initialize tracking |
-| `message_start` (user) | `prompt_submit` | → InProgress |
-| `tool_result` | `tool_complete` | → InProgress |
+| `agent_start` | `session_start` + `prompt_submit` | Reattach listener, → InProgress |
+| `message_start` (user) | `prompt_submit` | Correct/update query, → InProgress |
+| active turn heartbeat (~15s) | `session_start` + `prompt_submit` | Recover dropped tab state |
+| `tool_result` | `tool_complete` | Tool context update |
 | `agent_end` | `stop` | → Success ✓ |
 | `agent_end` + 300ms | `idle_prompt` | (no change) |
 
@@ -73,7 +75,7 @@ This gives Warp fine-grained session state: who's running, what they're doing, w
   "response": "Done! All tests pass.", // Agent's reply (truncated)
   "tool_name": "bash",                 // Last tool used
   "tool_input": {"command": "npm test"},// Tool arguments preview
-  "plugin_version": "0.1.0"            // Extension version
+  "plugin_version": "0.1.2"            // Extension version
 }
 ```
 

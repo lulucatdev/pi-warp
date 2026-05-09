@@ -18,7 +18,7 @@
  */
 
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ const PROTOCOL_VERSION = 1;
 const AGENT_ID = "pi";
 
 /** Extension's own version, reported in session_start for plugin-update UX. */
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.1.2";
 
 /** Braille dot-spinner frames — same sequence used by Codex CLI. */
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -45,6 +45,18 @@ const SPINNER_INTERVAL_MS = 100;
 
 /** Maximum characters kept from user query / assistant response in events. */
 const MAX_TEXT_PREVIEW = 200;
+
+/** How often to re-announce active work so Warp can recover dropped tab state. */
+const ACTIVE_HEARTBEAT_INTERVAL_MS = 15_000;
+
+/** Delay that lets Pi's user message event arrive before we send a fallback prompt. */
+const FALLBACK_PROMPT_SUBMIT_DELAY_MS = 75;
+
+/** Delay before telling Warp the prompt is idle again after a successful stop. */
+const IDLE_PROMPT_DELAY_MS = 300;
+
+/** Query text used when Pi resumes generation without adding a new user message. */
+const CONTINUE_QUERY = "Continuing previous turn";
 
 // ─── Environment detection ─────────────────────────────────────────────────
 
@@ -131,6 +143,17 @@ function extractText(content: unknown): string | undefined {
 	return undefined;
 }
 
+/** Extract the last assistant text from Pi's agent_end event. */
+function extractLastAssistantResponse(messages: AgentEndEvent["messages"]): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role === "assistant") {
+			return truncate(extractText(message.content));
+		}
+	}
+	return undefined;
+}
+
 // ─── Extension entry point ──────────────────────────────────────────────────
 
 export default function warpIntegration(pi: ExtensionAPI): void {
@@ -140,9 +163,15 @@ export default function warpIntegration(pi: ExtensionAPI): void {
 	// ── State ─────────────────────────────────────────────────────────────
 
 	let spinnerTimer: ReturnType<typeof setInterval> | null = null;
+	let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	let fallbackPromptTimer: ReturnType<typeof setTimeout> | null = null;
+	let idlePromptTimer: ReturnType<typeof setTimeout> | null = null;
 	let frameIndex = 0;
 	let sessionId: string | undefined;
+	let pendingQuery: string | undefined;
 	let lastQuery: string | undefined;
+	let promptSubmittedForTurn = false;
+	let promptSubmittedQuery: string | undefined;
 
 	// ── Title helpers ─────────────────────────────────────────────────────
 
@@ -187,45 +216,133 @@ export default function warpIntegration(pi: ExtensionAPI): void {
 		return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 	}
 
-	// ── Session lifecycle ─────────────────────────────────────────────────
+	function ensureSessionId(): string {
+		sessionId ??= makeSessionId();
+		return sessionId;
+	}
 
-	pi.on("session_start", async (_event, ctx) => {
-		sessionId = makeSessionId();
-		lastQuery = undefined;
-
+	function emitSessionStart(): void {
 		emitWarpEvent({
 			event: "session_start",
-			session_id: sessionId,
+			session_id: ensureSessionId(),
 			cwd: process.cwd(),
 			project: projectName(),
 			plugin_version: PLUGIN_VERSION,
 		});
+	}
+
+	function emitPromptSubmit(query: string | undefined): void {
+		promptSubmittedForTurn = true;
+		promptSubmittedQuery = query;
+		lastQuery = query ?? lastQuery;
+
+		emitWarpEvent({
+			event: "prompt_submit",
+			session_id: ensureSessionId(),
+			cwd: process.cwd(),
+			project: projectName(),
+			query,
+		});
+	}
+
+	function emitPromptSubmitIfChanged(query: string | undefined): void {
+		if (promptSubmittedForTurn && promptSubmittedQuery === query) return;
+		emitPromptSubmit(query);
+	}
+
+	function clearFallbackPromptTimer(): void {
+		if (fallbackPromptTimer) {
+			clearTimeout(fallbackPromptTimer);
+			fallbackPromptTimer = null;
+		}
+	}
+
+	function scheduleFallbackPromptSubmit(): void {
+		clearFallbackPromptTimer();
+		fallbackPromptTimer = setTimeout(() => {
+			fallbackPromptTimer = null;
+			if (!promptSubmittedForTurn) {
+				emitPromptSubmit(pendingQuery ?? lastQuery ?? CONTINUE_QUERY);
+			}
+		}, FALLBACK_PROMPT_SUBMIT_DELAY_MS);
+	}
+
+	function stopActiveHeartbeat(): void {
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = null;
+		}
+	}
+
+	function startActiveHeartbeat(): void {
+		stopActiveHeartbeat();
+		heartbeatTimer = setInterval(() => {
+			// Re-send both signals: session_start can recreate Warp's listener,
+			// prompt_submit refreshes an existing listener back to InProgress.
+			emitSessionStart();
+			emitPromptSubmit(promptSubmittedQuery ?? pendingQuery ?? lastQuery ?? CONTINUE_QUERY);
+		}, ACTIVE_HEARTBEAT_INTERVAL_MS);
+	}
+
+	function clearIdlePromptTimer(): void {
+		if (idlePromptTimer) {
+			clearTimeout(idlePromptTimer);
+			idlePromptTimer = null;
+		}
+	}
+
+	// ── Session lifecycle ─────────────────────────────────────────────────
+
+	pi.on("session_start", async (_event, ctx) => {
+		sessionId = makeSessionId();
+		pendingQuery = undefined;
+		lastQuery = undefined;
+		promptSubmittedForTurn = false;
+		promptSubmittedQuery = undefined;
+
+		emitSessionStart();
 
 		setStaticTitle(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		clearFallbackPromptTimer();
+		clearIdlePromptTimer();
+		stopActiveHeartbeat();
 		stopSpinner(ctx);
 	});
 
 	// ── Agent turn ────────────────────────────────────────────────────────
 
+	pi.on("before_agent_start", async (event, _ctx) => {
+		pendingQuery = truncate(event.prompt);
+	});
+
 	pi.on("agent_start", async (_event, ctx) => {
+		clearIdlePromptTimer();
+		promptSubmittedForTurn = false;
+		promptSubmittedQuery = undefined;
+
+		// Warp may drop the per-tab session after a completed turn. Re-announcing
+		// here lets the next prompt self-heal without restarting the Warp tab.
+		emitSessionStart();
+		if (pendingQuery) {
+			emitPromptSubmit(pendingQuery);
+		} else {
+			scheduleFallbackPromptSubmit();
+		}
+
 		startSpinner(ctx);
+		startActiveHeartbeat();
 	});
 
 	// Capture the user's prompt for query reporting
 	pi.on("message_start", async (event, _ctx) => {
 		if (event.message?.role === "user") {
-			lastQuery = truncate(extractText(event.message.content));
-
-			emitWarpEvent({
-				event: "prompt_submit",
-				session_id: sessionId,
-				cwd: process.cwd(),
-				project: projectName(),
-				query: lastQuery,
-			});
+			const query = truncate(extractText(event.message.content)) ?? pendingQuery;
+			lastQuery = query ?? lastQuery;
+			clearFallbackPromptTimer();
+			emitPromptSubmitIfChanged(query);
 		}
 	});
 
@@ -243,7 +360,7 @@ export default function warpIntegration(pi: ExtensionAPI): void {
 
 		emitWarpEvent({
 			event: "tool_complete",
-			session_id: sessionId,
+			session_id: ensureSessionId(),
 			cwd: process.cwd(),
 			project: projectName(),
 			tool_name: event.toolName,
@@ -252,29 +369,36 @@ export default function warpIntegration(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		clearFallbackPromptTimer();
+		stopActiveHeartbeat();
 		stopSpinner(ctx);
 
 		// Try to extract last assistant response
-		const response = truncate(extractText(event.message?.content));
+		const response = extractLastAssistantResponse(event.messages);
 
 		emitWarpEvent({
 			event: "stop",
-			session_id: sessionId,
+			session_id: ensureSessionId(),
 			cwd: process.cwd(),
 			project: projectName(),
 			query: lastQuery,
 			response,
 		});
+		pendingQuery = undefined;
+		promptSubmittedForTurn = false;
+		promptSubmittedQuery = undefined;
 
 		// Emit idle_prompt after a short delay so Warp knows the agent
 		// is alive but waiting for user input
-		setTimeout(() => {
+		clearIdlePromptTimer();
+		idlePromptTimer = setTimeout(() => {
+			idlePromptTimer = null;
 			emitWarpEvent({
 				event: "idle_prompt",
-				session_id: sessionId,
+				session_id: ensureSessionId(),
 				cwd: process.cwd(),
 				project: projectName(),
 			});
-		}, 300);
+		}, IDLE_PROMPT_DELAY_MS);
 	});
 }

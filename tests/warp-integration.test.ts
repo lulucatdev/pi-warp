@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { isWarpTerminal, emitWarpEvent, type WarpEventPayload } from "../extensions/warp-integration.js";
+import warpIntegration, { isWarpTerminal, emitWarpEvent, type WarpEventPayload } from "../extensions/warp-integration.js";
 
 // ─── isWarpTerminal ─────────────────────────────────────────────────────────
 
@@ -306,6 +306,111 @@ describe("Warp v1 protocol conformance", () => {
 		// If JSON.parse doesn't throw, the body is valid
 		const body = parseBody(captured[0]);
 		expect(body.tool_input.command).toBe('echo "hello\nworld"');
+	});
+});
+
+// ─── Extension lifecycle resilience ────────────────────────────────────────
+
+describe("extension lifecycle resilience", () => {
+	const originalEnv = { ...process.env };
+	let writeSpy: ReturnType<typeof vi.spyOn>;
+	let captured: string[];
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		process.env = { ...originalEnv, TERM_PROGRAM: "WarpTerminal" };
+		captured = [];
+		writeSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: any) => {
+			captured.push(typeof chunk === "string" ? chunk : chunk.toString());
+			return true;
+		});
+	});
+
+	afterEach(() => {
+		writeSpy.mockRestore();
+		vi.useRealTimers();
+		process.env = { ...originalEnv };
+	});
+
+	function createHarness() {
+		type Handler = (event: any, ctx: any) => void | Promise<void>;
+		const handlers = new Map<string, Handler[]>();
+		const pi = {
+			on: vi.fn((event: string, handler: Handler) => {
+				handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+			}),
+			getSessionName: vi.fn(() => "test-session"),
+		};
+		const ctx = { ui: { setTitle: vi.fn() } };
+		warpIntegration(pi as any);
+
+		return {
+			ctx,
+			async emit(event: string, payload: Record<string, any> = {}) {
+				for (const handler of handlers.get(event) ?? []) {
+					await handler({ type: event, ...payload }, ctx);
+				}
+			},
+		};
+	}
+
+	it("re-announces session and prompt on each agent_start", async () => {
+		const { emit } = createHarness();
+		await emit("session_start", { reason: "startup" });
+		captured = [];
+
+		await emit("before_agent_start", { prompt: "fix the bug" });
+		await emit("agent_start");
+
+		let bodies = captured.map(parseBody);
+		expect(bodies.map((body) => body.event)).toEqual(["session_start", "prompt_submit"]);
+		expect(bodies[1].query).toBe("fix the bug");
+
+		captured = [];
+		await emit("message_start", { message: { role: "user", content: "fix the bug" } });
+		expect(captured).toHaveLength(0);
+
+		await emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+		bodies = captured.map(parseBody);
+		expect(bodies[0].event).toBe("stop");
+		expect(bodies[0].query).toBe("fix the bug");
+		expect(bodies[0].response).toBe("done");
+
+		await emit("session_shutdown", { reason: "quit" });
+	});
+
+	it("emits a fallback prompt_submit for continuation turns", async () => {
+		const { emit } = createHarness();
+		await emit("session_start", { reason: "startup" });
+		captured = [];
+
+		await emit("agent_start");
+		expect(captured.map(parseBody).map((body) => body.event)).toEqual(["session_start"]);
+
+		await vi.advanceTimersByTimeAsync(75);
+		const bodies = captured.map(parseBody);
+		expect(bodies.map((body) => body.event)).toEqual(["session_start", "prompt_submit"]);
+		expect(bodies[1].query).toBe("Continuing previous turn");
+
+		await emit("agent_end", { messages: [] });
+		await emit("session_shutdown", { reason: "quit" });
+	});
+
+	it("heartbeats active turns with session_start and prompt_submit", async () => {
+		const { emit } = createHarness();
+		await emit("session_start", { reason: "startup" });
+		await emit("before_agent_start", { prompt: "long work" });
+		await emit("agent_start");
+		captured = [];
+
+		await vi.advanceTimersByTimeAsync(15_000);
+
+		const bodies = captured.map(parseBody);
+		expect(bodies.map((body) => body.event)).toEqual(["session_start", "prompt_submit"]);
+		expect(bodies[1].query).toBe("long work");
+
+		await emit("agent_end", { messages: [] });
+		await emit("session_shutdown", { reason: "quit" });
 	});
 });
 

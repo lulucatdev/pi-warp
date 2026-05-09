@@ -1,6 +1,6 @@
 {
   "name": "@capyup/pi-warp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Warp terminal integration for Pi — tab status, spinner, and rich session notifications via the warp://cli-agent protocol.",
   "repository": {
     "type": "git",
