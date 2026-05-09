@@ -1,20 +1,30 @@
 {
-  "name": "pi-warp",
+  "name": "@capyup/pi-warp",
   "version": "0.1.0",
   "description": "Warp terminal integration for Pi — tab status, spinner, and rich session notifications via the warp://cli-agent protocol.",
   "repository": {
     "type": "git",
     "url": "https://github.com/lulucatdev/pi-warp.git"
   },
+  "author": "capyup",
   "license": "MIT",
   "type": "module",
   "keywords": [
     "pi-package",
+    "pi",
     "pi-extension",
     "warp",
     "terminal",
     "cli-agent"
   ],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": [
       "./extensions/warp-integration.ts"

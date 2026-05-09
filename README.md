@@ -15,6 +15,10 @@ It also updates the terminal title with an animated braille spinner while the ag
 ## Install
 
 ```bash
+# From npm (recommended)
+pi install npm:@capyup/pi-warp
+
+# Or from git
 pi install git:github.com/lulucatdev/pi-warp
 ```
 
